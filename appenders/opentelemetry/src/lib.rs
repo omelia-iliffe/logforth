@@ -31,15 +31,27 @@ use logforth_core::kv::ValueView;
 use logforth_core::kv::Visitor;
 use logforth_core::record::Level;
 use logforth_core::record::Record;
+use opentelemetry::Context;
 use opentelemetry::InstrumentationScope;
 use opentelemetry::Key;
 use opentelemetry::logs::AnyValue;
 use opentelemetry::logs::LogRecord;
 use opentelemetry::logs::Logger;
 use opentelemetry::logs::LoggerProvider;
+use opentelemetry::trace::SpanContext;
+use opentelemetry::trace::TraceContextExt;
 use opentelemetry_otlp::LogExporter;
 use opentelemetry_sdk::logs::SdkLogRecord;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
+
+/// Resolves the [`SpanContext`] to stamp on each emitted log record for log↔trace
+/// correlation, or `None` to leave the record uncorrelated.
+///
+/// A plain `fn` pointer (rather than a boxed closure) so the appender stays `Debug`;
+/// resolvers read ambient thread-local/global state and need no captures. The default is
+/// [`current_otel_span_context`], and `fastrace`'s
+/// `fastrace_opentelemetry::current_opentelemetry_context` fits this signature directly.
+pub type TraceContextFn = fn() -> Option<SpanContext>;
 
 /// A builder to configure and create an [`OpentelemetryLog`] appender.
 #[derive(Debug)]
@@ -48,6 +60,7 @@ pub struct OpentelemetryLogBuilder {
     log_exporter: LogExporter,
     labels: Vec<(Cow<'static, str>, Cow<'static, str>)>,
     make_body: Option<Box<dyn MakeBody>>,
+    trace_context: Option<TraceContextFn>,
 }
 
 impl OpentelemetryLogBuilder {
@@ -73,6 +86,7 @@ impl OpentelemetryLogBuilder {
             log_exporter: log_exporter.into(),
             labels: vec![],
             make_body: None,
+            trace_context: None,
         }
     }
 
@@ -153,6 +167,36 @@ impl OpentelemetryLogBuilder {
         self
     }
 
+    /// Sets how the trace context stamped on each record is resolved, for log↔trace
+    /// correlation.
+    ///
+    /// By default the appender reads the active [`opentelemetry::Context`]
+    /// ([`current_otel_span_context`]), so a log emitted within an OpenTelemetry span is
+    /// correlated automatically. Override this to integrate a different tracing library:
+    /// `fastrace`'s `fastrace_opentelemetry::current_opentelemetry_context` fits the
+    /// [`TraceContextFn`] signature directly.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use logforth_append_opentelemetry::OpentelemetryLogBuilder;
+    /// use opentelemetry_otlp::LogExporter;
+    /// use opentelemetry_otlp::WithExportConfig;
+    ///
+    /// let log_exporter = LogExporter::builder()
+    ///     .with_http()
+    ///     .with_endpoint("http://localhost:4317")
+    ///     .build()
+    ///     .unwrap();
+    /// let builder = OpentelemetryLogBuilder::new("my_service", log_exporter)
+    ///     // e.g. `.trace_context(fastrace_opentelemetry::current_opentelemetry_context)`
+    ///     .trace_context(|| None);
+    /// ```
+    pub fn trace_context(mut self, trace_context: TraceContextFn) -> Self {
+        self.trace_context = Some(trace_context);
+        self
+    }
+
     /// Builds the [`OpentelemetryLog`] appender.
     ///
     /// # Examples
@@ -176,6 +220,7 @@ impl OpentelemetryLogBuilder {
             log_exporter,
             labels,
             make_body,
+            trace_context,
         } = self;
 
         let resource = opentelemetry_sdk::Resource::builder()
@@ -199,6 +244,7 @@ impl OpentelemetryLogBuilder {
             make_body,
             logger,
             provider,
+            trace_context: trace_context.unwrap_or(current_otel_span_context),
         }
     }
 }
@@ -224,6 +270,7 @@ pub struct OpentelemetryLog {
     make_body: Option<Box<dyn MakeBody>>,
     logger: opentelemetry_sdk::logs::SdkLogger,
     provider: SdkLoggerProvider,
+    trace_context: TraceContextFn,
 }
 
 impl Append for OpentelemetryLog {
@@ -278,6 +325,16 @@ impl Append for OpentelemetryLog {
             d.visit(&mut extractor)?;
         }
 
+        // Correlate the log with its trace: stamp the resolved span context so a backend
+        // can link this record to the span. Absent/invalid context leaves it uncorrelated.
+        if let Some(span_context) = (self.trace_context)().filter(SpanContext::is_valid) {
+            log_record.set_trace_context(
+                span_context.trace_id(),
+                span_context.span_id(),
+                Some(span_context.trace_flags()),
+            );
+        }
+
         self.logger.emit(log_record);
         Ok(())
     }
@@ -322,6 +379,15 @@ fn log_level_to_otel_severity(level: Level) -> opentelemetry::logs::Severity {
         Level::Fatal3 => opentelemetry::logs::Severity::Fatal3,
         Level::Fatal4 => opentelemetry::logs::Severity::Fatal4,
     }
+}
+
+/// Resolves the span context from the active [`opentelemetry::Context`]. This is the
+/// default [`TraceContextFn`], correlating each log with the OpenTelemetry span in scope
+/// when it was emitted; returns `None` when no valid span is active.
+pub fn current_otel_span_context() -> Option<SpanContext> {
+    let context = Context::current();
+    let span_context = context.span().span_context().clone();
+    span_context.is_valid().then_some(span_context)
 }
 
 /// A trait for formatting log records into a body that can be sent to OpenTelemetry.
@@ -425,5 +491,39 @@ fn value_to_any_value(value: ValueView) -> AnyValue {
             AnyValue::Map(Box::new(m))
         }
         v => AnyValue::String(v.to_string().into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use opentelemetry::Context;
+    use opentelemetry::trace::SpanContext;
+    use opentelemetry::trace::SpanId;
+    use opentelemetry::trace::TraceContextExt;
+    use opentelemetry::trace::TraceFlags;
+    use opentelemetry::trace::TraceId;
+    use opentelemetry::trace::TraceState;
+
+    use super::current_otel_span_context;
+
+    #[test]
+    fn default_resolver_reads_the_active_span() {
+        // No span in scope: nothing to correlate.
+        assert!(current_otel_span_context().is_none());
+
+        let span_context = SpanContext::new(
+            TraceId::from(0x1234_5678_9abc_def0_1122_3344_5566_7788u128),
+            SpanId::from(0x0123_4567_89ab_cdefu64),
+            TraceFlags::SAMPLED,
+            false,
+            TraceState::default(),
+        );
+        let guard = Context::current()
+            .with_remote_span_context(span_context.clone())
+            .attach();
+        assert_eq!(current_otel_span_context(), Some(span_context));
+
+        drop(guard);
+        assert!(current_otel_span_context().is_none());
     }
 }

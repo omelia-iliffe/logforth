@@ -33,7 +33,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 logforth-core = { workspace = true }
-opentelemetry = { workspace = true, features = ["logs"] }
+opentelemetry = { workspace = true, features = ["logs", "trace"] }
 opentelemetry-otlp = { workspace = true, features = ["http-proto", "logs"] }
 opentelemetry_sdk = { workspace = true, features = ["logs"] }
 
