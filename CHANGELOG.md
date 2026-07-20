@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### New features
+
+* `OpentelemetryLog` now stamps each log record's trace context for log↔trace correlation. It is resolved from the active `opentelemetry::Context` by default (`current_otel_span_context`) and overridable via `OpentelemetryLogBuilder::trace_context` — e.g. pass `fastrace_opentelemetry::current_opentelemetry_context` to correlate with `fastrace` spans.
+
 ## [0.30.1] 2026-06-03
 
 ### Improvements
