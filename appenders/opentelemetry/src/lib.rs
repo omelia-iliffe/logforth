@@ -41,6 +41,7 @@ use opentelemetry::logs::LoggerProvider;
 use opentelemetry::trace::SpanContext;
 use opentelemetry::trace::TraceContextExt;
 use opentelemetry_otlp::LogExporter;
+use opentelemetry_sdk::logs::LogExporter as SdkLogExporter;
 use opentelemetry_sdk::logs::SdkLogRecord;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 
@@ -54,16 +55,21 @@ use opentelemetry_sdk::logs::SdkLoggerProvider;
 pub type TraceContextFn = fn() -> Option<SpanContext>;
 
 /// A builder to configure and create an [`OpentelemetryLog`] appender.
+///
+/// Generic over the exporter so a caller can interpose its own, which is the only place an
+/// export failure is observable: [`build`](Self::build) owns the [`SdkLoggerProvider`], and the
+/// SDK's batch processor discards both the batch and the error. The parameter defaults to
+/// [`opentelemetry_otlp::LogExporter`], so a caller that wants the OTLP one names nothing.
 #[derive(Debug)]
-pub struct OpentelemetryLogBuilder {
+pub struct OpentelemetryLogBuilder<E = LogExporter> {
     name: String,
-    log_exporter: LogExporter,
+    log_exporter: E,
     labels: Vec<(Cow<'static, str>, Cow<'static, str>)>,
     make_body: Option<Box<dyn MakeBody>>,
     trace_context: Option<TraceContextFn>,
 }
 
-impl OpentelemetryLogBuilder {
+impl<E: SdkLogExporter + 'static> OpentelemetryLogBuilder<E> {
     /// Creates a new [`OpentelemetryLogBuilder`].
     ///
     /// # Examples
@@ -80,10 +86,10 @@ impl OpentelemetryLogBuilder {
     ///     .unwrap();
     /// let builder = OpentelemetryLogBuilder::new("my_service", log_exporter);
     /// ```
-    pub fn new(name: impl Into<String>, log_exporter: impl Into<LogExporter>) -> Self {
+    pub fn new(name: impl Into<String>, log_exporter: E) -> Self {
         OpentelemetryLogBuilder {
             name: name.into(),
-            log_exporter: log_exporter.into(),
+            log_exporter,
             labels: vec![],
             make_body: None,
             trace_context: None,
